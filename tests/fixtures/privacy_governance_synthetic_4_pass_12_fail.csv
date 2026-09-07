@@ -1,0 +1,17 @@
+check_name,status,details
+required_columns,FAIL,Ausentes: ['seller_key']
+forbidden_columns_absent,FAIL,"Presentes indevidas: ['customer_city', 'customer_id', 'product_id', 'seller_id']"
+unexpected_columns,FAIL,"Inesperadas: ['customer_city', 'customer_id', 'product_id', 'seller_id']"
+pseudonymized__order_id,FAIL,Prefixo esperado: `order_id_`
+pseudonymized__customer_unique_id,FAIL,Prefixo esperado: `customer_unique_id_`
+pseudonymized__seller_key,FAIL,Coluna obrigatória ausente.
+default_fill__customer_state,FAIL,nulls=1 | default_observado=False | default_aplicado=False
+default_fill__seller_state,FAIL,nulls=1 | default_observado=False | default_aplicado=False
+default_fill__order_status,FAIL,nulls=1 | default_observado=False | default_aplicado=False
+default_fill__payment_type_mode,FAIL,nulls=1 | default_observado=False | default_aplicado=False
+default_fill__seller_volume_tier,FAIL,nulls=1 | default_observado=False | default_aplicado=False
+classification_leakage,FAIL,"Colunas sensíveis expostas: ['customer_city', 'customer_id', 'seller_id']"
+policy_required_columns_alignment,PASS,Contrato e política LGPD devem ter as mesmas colunas obrigatórias.
+policy_forbidden_columns_alignment,PASS,Contrato e política LGPD devem ter as mesmas colunas proibidas.
+policy_pseudonymization_alignment,PASS,Contrato e política LGPD devem ter o mesmo mapeamento de pseudonimização.
+policy_default_fill_alignment,PASS,Contrato e política LGPD devem ter os mesmos defaults de preenchimento.

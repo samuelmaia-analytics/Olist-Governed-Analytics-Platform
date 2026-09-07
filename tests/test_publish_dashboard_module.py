@@ -54,6 +54,7 @@ def build_source_df() -> pd.DataFrame:
 def test_pseudonymize_returns_stable_prefix_and_preserves_na() -> None:
     pseudonymized = publish_dashboard.pseudonymize("abc", "order_id")
 
+    assert isinstance(pseudonymized, str)
     assert pseudonymized.startswith("order_id_")
     assert publish_dashboard.pseudonymize(pd.NA, "order_id") is pd.NA
 
@@ -165,6 +166,8 @@ def test_save_outputs_save_report_and_run_publish_dashboard(
 def test_run_publish_dashboard_fails_when_privacy_validation_breaks(
     tmp_path: Path, monkeypatch
 ) -> None:
+    quality_dir = tmp_path / "quality"
+    privacy_results_path = quality_dir / "privacy_governance_results.csv"
     contract_path = tmp_path / "privacy_governance.json"
     contract_path.write_text(
         Path(publish_dashboard.PRIVACY_CONTRACT_PATH).read_text(encoding="utf-8"),
@@ -173,7 +176,13 @@ def test_run_publish_dashboard_fails_when_privacy_validation_breaks(
     broken_df = build_source_df()
     broken_df["customer_city"] = ["sao paulo"]
 
+    monkeypatch.setattr(publish_dashboard, "QUALITY_DIR", quality_dir)
     monkeypatch.setattr(publish_dashboard, "PRIVACY_CONTRACT_PATH", contract_path)
+    monkeypatch.setattr(
+        publish_dashboard,
+        "PRIVACY_RESULTS_PATH",
+        privacy_results_path,
+    )
     monkeypatch.setattr(publish_dashboard, "load_internal_fact", lambda: broken_df)
     monkeypatch.setattr(
         publish_dashboard,
@@ -183,3 +192,5 @@ def test_run_publish_dashboard_fails_when_privacy_validation_breaks(
 
     with pytest.raises(RuntimeError, match="Validação LGPD/governança falhou"):
         publish_dashboard.run_publish_dashboard()
+
+    assert privacy_results_path.exists()
