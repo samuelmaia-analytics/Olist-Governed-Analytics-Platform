@@ -6,11 +6,13 @@ import logging
 import platform
 import subprocess
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Callable
+from typing import Callable, Iterator
 
 import pandas as pd
 
@@ -34,6 +36,7 @@ from src.governance_scorecards import main as governance_scorecards_main
 from src.ingest import configure_logging, run_inventory
 from src.lineage import main as lineage_main
 from src.preprocess import run_profiling
+from src.publication_provenance import PipelineGovernanceContext
 from src.publish_dashboard import run_publish_dashboard
 from src.published_monitoring import (
     EXPECTED_COLUMNS,
@@ -92,11 +95,6 @@ PIPELINE_STEPS = [
     PipelineStep(
         "build", "Constrói a tabela analítica principal fact_orders_enriched."
     ),
-    PipelineStep("publish", "Publica a camada minimizada para consumo do dashboard."),
-    PipelineStep(
-        "semantic",
-        "Materializa marts semânticos publicados para logística, seller e cohort.",
-    ),
     PipelineStep(
         "classify", "Materializa o inventário de classificação de dados do projeto."
     ),
@@ -107,6 +105,11 @@ PIPELINE_STEPS = [
         "business_rules", "Executa regras de negócio declaradas por contrato."
     ),
     PipelineStep("quality", "Executa os checks de qualidade e salva os relatórios."),
+    PipelineStep("publish", "Publica a camada minimizada para consumo do dashboard."),
+    PipelineStep(
+        "semantic",
+        "Materializa marts semânticos publicados para logística, seller e cohort.",
+    ),
     PipelineStep("monitor", "Monitora freshness e qualidade da camada publicada."),
     PipelineStep("scorecards", "Publica scorecards de governança por dataset."),
     PipelineStep("lineage", "Gera lineage técnico automatizado do pipeline."),
@@ -122,9 +125,28 @@ PIPELINE_REPORT_PATH = DOCS_DIR / "reports" / "operational_job_report.md"
 StepHandler = Callable[[], object]
 
 
+_ACTIVE_GOVERNANCE_CONTEXT: ContextVar[PipelineGovernanceContext | None] = (
+    ContextVar("pipeline_governance_context", default=None)
+)
+
+
+@contextmanager
+def activate_pipeline_governance_context(
+    context: PipelineGovernanceContext,
+) -> Iterator[PipelineGovernanceContext]:
+    token = _ACTIVE_GOVERNANCE_CONTEXT.set(context)
+    try:
+        yield context
+    finally:
+        _ACTIVE_GOVERNANCE_CONTEXT.reset(token)
+
+
 def _run_quality_step() -> None:
     fact_df = load_fact_table()
     results = run_quality_checks(fact_df)
+    context = _ACTIVE_GOVERNANCE_CONTEXT.get()
+    if context is not None:
+        context.record_quality(results, produced_at=datetime.now(UTC))
     save_quality_results(results)
     save_quality_report(fact_df, results)
 
@@ -244,7 +266,10 @@ def execute_step(step_name: str) -> None:
     handler = STEP_HANDLERS.get(step_name)
     if handler is None:  # pragma: no cover
         raise ValueError(f"Etapa desconhecida: {step_name}")
-    handler()
+    if step_name == "publish" and _ACTIVE_GOVERNANCE_CONTEXT.get() is not None:
+        run_publish_dashboard()
+    else:
+        handler()
 
 
 def resolve_git_commit() -> str:
@@ -260,11 +285,15 @@ def resolve_git_commit() -> str:
     return completed.stdout.strip() or "unknown"
 
 
+def build_pipeline_run_id(started_at: datetime) -> str:
+    return started_at.strftime("run-%Y%m%dT%H%M%SZ")
+
+
 def build_run_metadata(
     started_at: datetime, completed_at: datetime
 ) -> PipelineRunMetadata:
     return PipelineRunMetadata(
-        run_id=started_at.strftime("run-%Y%m%dT%H%M%SZ"),
+        run_id=build_pipeline_run_id(started_at),
         started_at_utc=started_at.isoformat(),
         completed_at_utc=completed_at.isoformat(),
         python_version=platform.python_version(),
@@ -361,15 +390,20 @@ def main() -> None:
     selected_steps = resolve_steps(args.steps)
     LOGGER.info("Pipeline selecionado: %s", ", ".join(selected_steps))
     started_at = datetime.now(UTC)
-    executions: list[StepExecution] = []
-    try:
-        executions = run_selected_steps(
-            selected_steps, continue_on_error=args.continue_on_error
-        )
-    finally:
-        completed_at = datetime.now(UTC)
-        metadata = build_run_metadata(started_at, completed_at)
-        save_pipeline_execution_report(selected_steps, executions, metadata)
+    context = PipelineGovernanceContext(
+        run_id=build_pipeline_run_id(started_at),
+        started_at=started_at,
+    )
+    with activate_pipeline_governance_context(context):
+        executions: list[StepExecution] = []
+        try:
+            executions = run_selected_steps(
+                selected_steps, continue_on_error=args.continue_on_error
+            )
+        finally:
+            completed_at = datetime.now(UTC)
+            metadata = build_run_metadata(started_at, completed_at)
+            save_pipeline_execution_report(selected_steps, executions, metadata)
 
 
 if __name__ == "__main__":

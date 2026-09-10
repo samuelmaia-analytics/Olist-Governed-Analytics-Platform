@@ -1,14 +1,30 @@
 from __future__ import annotations
 
+# ruff: noqa: E402, I001
+
 import argparse
 import csv
 import json
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, cast
 
-DEFAULT_OUTPUT_PATH = Path("data/gold/publication_decisions.csv")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.infrastructure.postgres.quality_repository import (
+    calculate_quality_score,
+    get_quality_summary,
+)
+
+DEFAULT_OUTPUT_PATH = Path(
+    "data/gold/publication_decisions.csv"
+)
+
 FIELDNAMES = [
     "execution_id",
     "dataset_name",
@@ -30,6 +46,11 @@ class PublicationGateInput:
     critical_issues: int
     execution_id: str
     approved_by: str
+    postgres_run_id: int | None = None
+    pass_checks: int = 0
+    warn_checks: int = 0
+    fail_checks: int = 0
+    total_checks: int | None = None
 
 
 @dataclass(frozen=True)
@@ -59,7 +80,9 @@ class PublicationGateDecision:
 
 
 def build_execution_id() -> str:
-    return datetime.now(UTC).strftime("pubgate-%Y%m%dT%H%M%S%fZ")
+    return datetime.now(UTC).strftime(
+        "pubgate-%Y%m%dT%H%M%S%fZ"
+    )
 
 
 def evaluate_publication_gate(
@@ -84,14 +107,30 @@ def evaluate_publication_gate(
     )
 
 
-def build_decision(input_data: PublicationGateInput) -> PublicationGateDecision:
+def build_decision(
+    input_data: PublicationGateInput,
+) -> PublicationGateDecision:
+    if input_data.postgres_run_id is not None or input_data.total_checks is not None:
+        raise RuntimeError(
+            "O caminho PostgreSQL de run_publication_gate.py não é "
+            "autoritativo: falta evidência current-run de privacy. "
+            "Use scripts/run_governance_pipeline.py para obter a "
+            "decisão operacional completa."
+        )
+
     decision, reason = evaluate_publication_gate(
         quality_score=input_data.quality_score,
         lgpd_risk_score=input_data.lgpd_risk_score,
         critical_issues=input_data.critical_issues,
     )
-    approved_at = datetime.now(UTC).isoformat() if decision == "Approved" else ""
-    approved_by = input_data.approved_by if decision == "Approved" else ""
+
+    approved_at = ""
+    approved_by = ""
+
+    if decision == "Approved":
+        approved_at = datetime.now(UTC).isoformat()
+        approved_by = input_data.approved_by
+
     return PublicationGateDecision(
         execution_id=input_data.execution_id,
         dataset_name=input_data.dataset_name,
@@ -109,74 +148,309 @@ def append_decisions(
     decisions: Iterable[PublicationGateDecision],
     output_path: Path = DEFAULT_OUTPUT_PATH,
 ) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not output_path.exists() or output_path.stat().st_size == 0
-    with output_path.open("a", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    write_header = (
+        not output_path.exists()
+        or output_path.stat().st_size == 0
+    )
+
+    if not write_header:
+        with output_path.open("r", encoding="utf-8", newline="") as existing:
+            if next(csv.reader(existing), None) != FIELDNAMES:
+                raise ValueError("Existing publication CSV header is incompatible.")
+
+    with output_path.open(
+        "a",
+        encoding="utf-8",
+        newline="",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=FIELDNAMES,
+        )
+
         if write_header:
             writer.writeheader()
+
         for decision in decisions:
-            writer.writerow(decision.as_row())
+            writer.writerow(
+                decision.as_row()
+            )
 
 
-def _build_input_from_mapping(raw: dict[str, object], args: argparse.Namespace) -> PublicationGateInput:
+def build_input_from_postgres(
+    *,
+    postgres_run_id: int,
+    dataset_name: str,
+    lgpd_risk_score: int,
+    approved_by: str,
+    execution_id: str | None = None,
+) -> PublicationGateInput:
+
+    summary = get_quality_summary(
+        postgres_run_id
+    )
+
+    if summary["total_checks"] == 0:
+        raise RuntimeError(
+            "Nenhum resultado de qualidade encontrado "
+            f"para o PostgreSQL run_id={postgres_run_id}."
+        )
+
+    quality_score = calculate_quality_score(
+        postgres_run_id
+    )
+
     return PublicationGateInput(
-        dataset_name=str(raw["dataset_name"]),
-        quality_score=int(raw["quality_score"]),
-        lgpd_risk_score=int(raw["lgpd_risk_score"]),
-        critical_issues=int(raw.get("critical_issues", 0)),
-        execution_id=str(raw.get("execution_id") or args.execution_id or build_execution_id()),
-        approved_by=str(raw.get("approved_by") or args.approved_by),
+        dataset_name=dataset_name,
+        quality_score=quality_score,
+        lgpd_risk_score=lgpd_risk_score,
+        critical_issues=summary[
+            "critical_failures"
+        ],
+        execution_id=(
+            execution_id
+            or build_execution_id()
+        ),
+        approved_by=approved_by,
+        postgres_run_id=postgres_run_id,
+        pass_checks=summary["pass_checks"],
+        warn_checks=summary["warn_checks"],
+        fail_checks=summary["fail_checks"],
+        total_checks=summary["total_checks"],
     )
 
 
-def load_inputs_from_file(path: Path, args: argparse.Namespace) -> list[PublicationGateInput]:
+def _build_input_from_mapping(
+    raw: dict[str, object],
+    args: argparse.Namespace,
+) -> PublicationGateInput:
+
+    return PublicationGateInput(
+        dataset_name=str(
+            raw["dataset_name"]
+        ),
+        quality_score=int(
+            cast(
+                str | int | float,
+                raw["quality_score"],
+            )
+        ),
+        lgpd_risk_score=int(
+            cast(
+                str | int | float,
+                raw["lgpd_risk_score"],
+            )
+        ),
+        critical_issues=int(
+            cast(
+                str | int | float,
+                raw.get(
+                    "critical_issues",
+                    0,
+                ),
+            )
+        ),
+        execution_id=str(
+            raw.get("execution_id")
+            or args.execution_id
+            or build_execution_id()
+        ),
+        approved_by=str(
+            raw.get("approved_by")
+            or args.approved_by
+        ),
+    )
+
+
+def load_inputs_from_file(
+    path: Path,
+    args: argparse.Namespace,
+) -> list[PublicationGateInput]:
+
     suffix = path.suffix.lower()
+
     if suffix == ".json":
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-        records = loaded if isinstance(loaded, list) else [loaded]
-        return [_build_input_from_mapping(dict(record), args) for record in records]
-    with path.open("r", encoding="utf-8", newline="") as file:
+        loaded = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        records = (
+            loaded
+            if isinstance(loaded, list)
+            else [loaded]
+        )
+
+        return [
+            _build_input_from_mapping(
+                dict(record),
+                args,
+            )
+            for record in records
+        ]
+
+    with path.open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as file:
+
         reader = csv.DictReader(file)
-        return [_build_input_from_mapping(dict(row), args) for row in reader]
+
+        return [
+            _build_input_from_mapping(
+                dict(row),
+                args,
+            )
+            for row in reader
+        ]
 
 
 def parse_args() -> argparse.Namespace:
+
     parser = argparse.ArgumentParser(
-        description="Apply publication gate rules and append the decision to data/gold/publication_decisions.csv."
+        description=(
+            "Apply publication gate rules using "
+            "PostgreSQL governance results or "
+            "explicit input values."
+        )
     )
-    parser.add_argument("--dataset-name", help="Dataset evaluated by the gate.")
-    parser.add_argument("--quality-score", type=int, help="Data quality score from 0 to 100.")
-    parser.add_argument("--lgpd-risk-score", type=int, help="LGPD risk score from 0 to 100.")
-    parser.add_argument("--critical-issues", type=int, default=0, help="Critical issues found before publication.")
-    parser.add_argument("--execution-id", help="Optional execution identifier.")
-    parser.add_argument("--approved-by", default="publication_gate_cli", help="Approver recorded when the decision is Approved.")
-    parser.add_argument("--input-file", type=Path, help="Optional CSV or JSON file with publication gate inputs.")
-    parser.add_argument("--output-file", type=Path, default=DEFAULT_OUTPUT_PATH, help="Output CSV path.")
+
+    parser.add_argument(
+        "--postgres-run-id",
+        type=int,
+        help=(
+            "PostgreSQL pipeline run_id used "
+            "to retrieve quality results."
+        ),
+    )
+
+    parser.add_argument(
+        "--dataset-name",
+        help="Dataset evaluated by the gate.",
+    )
+
+    parser.add_argument(
+        "--quality-score",
+        type=int,
+        help="Data quality score from 0 to 100.",
+    )
+
+    parser.add_argument(
+        "--lgpd-risk-score",
+        type=int,
+        help="LGPD risk score from 0 to 100.",
+    )
+
+    parser.add_argument(
+        "--critical-issues",
+        type=int,
+        default=0,
+    )
+
+    parser.add_argument(
+        "--execution-id",
+    )
+
+    parser.add_argument(
+        "--approved-by",
+        default="publication_gate_cli",
+    )
+
+    parser.add_argument(
+        "--input-file",
+        type=Path,
+    )
+
+    parser.add_argument(
+        "--output-file",
+        type=Path,
+        default=DEFAULT_OUTPUT_PATH,
+    )
+
     return parser.parse_args()
 
 
-def build_inputs(args: argparse.Namespace) -> list[PublicationGateInput]:
+def build_inputs(
+    args: argparse.Namespace,
+) -> list[PublicationGateInput]:
+
+    if args.postgres_run_id is not None:
+
+        if not args.dataset_name:
+            raise SystemExit(
+                "--dataset-name is required "
+                "when using --postgres-run-id."
+            )
+
+        return [
+            build_input_from_postgres(
+                postgres_run_id=(
+                    args.postgres_run_id
+                ),
+                dataset_name=(
+                    args.dataset_name
+                ),
+                lgpd_risk_score=(
+                    args.lgpd_risk_score
+                ),
+                approved_by=(
+                    args.approved_by
+                ),
+                execution_id=(
+                    args.execution_id
+                ),
+            )
+        ]
+
     if args.input_file:
-        return load_inputs_from_file(args.input_file, args)
+        return load_inputs_from_file(
+            args.input_file,
+            args,
+        )
+
     missing = [
         name
         for name, value in {
-            "--dataset-name": args.dataset_name,
-            "--quality-score": args.quality_score,
+            "--dataset-name": (
+                args.dataset_name
+            ),
+            "--quality-score": (
+                args.quality_score
+            ),
             "--lgpd-risk-score": args.lgpd_risk_score,
         }.items()
         if value is None
     ]
+
     if missing:
-        raise SystemExit(f"Missing required arguments: {', '.join(missing)}")
+        raise SystemExit(
+            "Missing required arguments: "
+            + ", ".join(missing)
+        )
+
     return [
         PublicationGateInput(
             dataset_name=args.dataset_name,
             quality_score=args.quality_score,
-            lgpd_risk_score=args.lgpd_risk_score,
-            critical_issues=args.critical_issues,
-            execution_id=args.execution_id or build_execution_id(),
+            lgpd_risk_score=(
+                args.lgpd_risk_score
+            ),
+            critical_issues=(
+                args.critical_issues
+            ),
+            execution_id=(
+                args.execution_id
+                or build_execution_id()
+            ),
             approved_by=args.approved_by,
         )
     ]
