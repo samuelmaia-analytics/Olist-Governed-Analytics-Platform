@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +12,7 @@ if __package__ is None or __package__ == "":
 
 from src.config import ANALYTICS_DIR, DOCS_DIR, QUALITY_DIR
 from src.ingest import configure_logging
+from src.quality_components.models import QualityCheckResult as QualityCheckResult
 from src.utils import ensure_directory
 
 LOGGER = logging.getLogger(__name__)
@@ -59,16 +60,6 @@ MAX_DIMENSION_JOIN_MISSING_PCT = 1.0
 MAX_PAYMENT_GAP_OVER_1_REAL_PCT = 5.0
 MAX_DELIVERY_BEFORE_APPROVAL_PCT = 0.1
 MIN_RECORDS = 100_001
-
-
-@dataclass
-class QualityCheckResult:
-    check_name: str
-    status: str
-    metric_value: float | str
-    threshold: float | str
-    severity: str
-    details: str
 
 
 def validate_not_empty(df: pd.DataFrame, dataset_name: str) -> None:

@@ -7,6 +7,11 @@ PublicationDecision = Literal["Approved", "Needs Review", "Blocked"]
 PublicationSeverity = Literal["Low", "Medium", "High", "Critical"]
 FreshnessStatus = Literal["fresh", "warning", "stale"]
 SchemaContractStatus = Literal["passed", "failed"]
+OperationalPublicationDecision = Literal[
+    "APPROVED",
+    "APPROVED_WITH_WARNINGS",
+    "BLOCKED",
+]
 
 # Recommended thresholds (portfolio-grade defaults, easy to tune later)
 MIN_DATA_QUALITY_SCORE_REVIEW = 80
@@ -22,6 +27,97 @@ class PublicationReadinessDecision:
     severity: PublicationSeverity
     reasons: list[str]
     required_actions: list[str]
+
+
+@dataclass(frozen=True)
+class OperationalPublicationGateDecision:
+    """Pre-publish decision derived from same-run Data Quality evidence."""
+
+    decision: OperationalPublicationDecision
+    reason: str
+    total_checks: int
+    pass_checks: int
+    warn_checks: int
+    fail_checks: int
+    critical_failures: int
+    quality_score: int
+    privacy_failed_checks: int = 0
+
+
+def evaluate_operational_publication_gate(
+    *,
+    total_checks: int,
+    pass_checks: int,
+    warn_checks: int,
+    fail_checks: int,
+    critical_failures: int,
+    privacy_failed_checks: int = 0,
+) -> OperationalPublicationGateDecision:
+    """Evaluate the operational gate using current-run quality counts only."""
+
+    counts = {
+        "total_checks": total_checks,
+        "pass_checks": pass_checks,
+        "warn_checks": warn_checks,
+        "fail_checks": fail_checks,
+        "critical_failures": critical_failures,
+        "privacy_failed_checks": privacy_failed_checks,
+    }
+    if any(value < 0 for value in counts.values()):
+        raise ValueError("Publication Gate check counts must be non-negative.")
+
+    quality_score = (
+        round((pass_checks / total_checks) * 100)
+        if total_checks > 0
+        else 0
+    )
+
+    if total_checks == 0:
+        decision: OperationalPublicationDecision = "BLOCKED"
+        reason = (
+            "Nenhum resultado de qualidade da execução atual está disponível."
+        )
+    elif pass_checks + warn_checks + fail_checks != total_checks:
+        decision = "BLOCKED"
+        reason = (
+            "As contagens de qualidade da execução atual são inconsistentes."
+        )
+    elif fail_checks > 0 or critical_failures > 0:
+        decision = "BLOCKED"
+        reason = (
+            "Publicação bloqueada porque a execução atual contém checks "
+            "de qualidade reprovados ou falhas críticas."
+        )
+    elif privacy_failed_checks > 0:
+        decision = "BLOCKED"
+        reason = (
+            "Publicação bloqueada porque a execução atual contém controles "
+            "de privacidade reprovados."
+        )
+    elif warn_checks > 0:
+        decision = "APPROVED_WITH_WARNINGS"
+        reason = (
+            "Publicação autorizada com warnings porque a execução atual "
+            "não contém checks reprovados nem falhas críticas."
+        )
+    else:
+        decision = "APPROVED"
+        reason = (
+            "Publicação autorizada porque todos os checks de qualidade "
+            "da execução atual foram aprovados."
+        )
+
+    return OperationalPublicationGateDecision(
+        decision=decision,
+        reason=reason,
+        total_checks=total_checks,
+        pass_checks=pass_checks,
+        warn_checks=warn_checks,
+        fail_checks=fail_checks,
+        critical_failures=critical_failures,
+        quality_score=quality_score,
+        privacy_failed_checks=privacy_failed_checks,
+    )
 
 
 def evaluate_publication_readiness(
